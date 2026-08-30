@@ -293,6 +293,7 @@ async def ask(question: str, state: ConversationState, monday_token: str) -> str
     if plan.needs_clarification():
         state.history.append({"role": "user", "content": question})
         state.history.append({"role": "assistant", "content": plan.clarification_question})
+        state.last_plan = plan  # preserves whatever fields the model WAS confident about
         return plan.clarification_question
 
     try:
@@ -310,6 +311,7 @@ async def ask(question: str, state: ConversationState, monday_token: str) -> str
     except NeedsClarification as exc:
         state.history.append({"role": "user", "content": question})
         state.history.append({"role": "assistant", "content": exc.question})
+        state.last_plan = plan  # e.g. the sector was recognized, only the value didn't match live data
         return exc.question
     except I.InsightsSchemaError as exc:
         return f"⚠️ {exc}"

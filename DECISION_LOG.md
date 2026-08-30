@@ -229,8 +229,73 @@ and were fixed as a direct result, not left for later:
   answer if the retry also fails. The underlying computation was never wrong
   in any of this — only the LLM's restatement of it, rarely, was.
 
+## Production crash: anyio cancel-scope violation on first real deployed use
+
+The deployed app's very first real question failed with `Attempted to exit
+cancel scope in a different task than it was entered in`. Root cause, found
+by direct reproduction (not guessed): `MondayMCPClient.__aenter__` wrapped
+`stack.enter_async_context(stdio_client(params))` in `asyncio.wait_for`.
+`stdio_client` is an anyio-based context manager whose `__aenter__` opens a
+task group meant to stay alive for the whole session (its reader/writer pump
+tasks); `wait_for` runs its coroutine in a separate `ensure_future()` task, so
+that task group's entry was bound to an ephemeral task, while the matching
+exit (via `AsyncExitStack.aclose()` in `__aexit__`, called later from the
+original task) ran in a different one — exactly the error text.
+
+The first fix attempt (swap `asyncio.wait_for` for `anyio.fail_after`, same
+placement) was **also wrong** and reproduced a second failure, this time a
+deadlock: closing an outer `fail_after` scope while an inner one it contains
+(stdio_client's task group, deliberately still open) remains open is illegal
+in anyio regardless of whether anything actually timed out — this holds even
+on the successful, non-timing-out path. Confirmed via a minimal reproduction
+script before touching the real fix: wrapping the *entire* connect-use-close
+lifecycle in one `fail_after` scope works; wrapping just the entry does not,
+by either method. Final fix: no timeout wraps `stdio_client`'s own entry at
+all (accept that a hang here is a narrow residual risk — subprocess spawn
+either fails fast or succeeds fast in practice); `session.initialize()` and
+each individual tool call (already the case) ARE safely wrapped in
+`anyio.fail_after`, since neither opens a task group of its own that needs to
+outlive the call. Verified via 3 sequential fresh `asyncio.run()` cycles (the
+exact pattern Streamlit uses per rerun) and, more importantly, through the
+actual Streamlit UI in a fresh browser session asking the exact question that
+failed in production, plus follow-ups — all succeeded with no crash.
+
+**Files changed for this fix**: `src/monday_mcp_client.py` (the above), and
+`requirements.txt` (added `anyio` explicitly — it was already an indirect
+dependency of `mcp`, but is now imported directly).
+
+## Multi-turn context gap found while verifying the crash fix (partially fixed)
+
+Replaying a 3-turn sequence during crash verification ("energy sector this
+quarter" → clarification → "Renewables instead" → "Billed revenue") surfaced
+a second, unrelated real bug: clarification exchanges discarded every plan
+field except the clarifying question itself, and `agent.ask()` never updated
+`state.last_plan` on a clarification turn — so a sector the model had already
+correctly identified was silently lost by the next turn. Fixed at both
+layers: `query_engine.parse_query` now keeps all recognized fields alongside
+a `clarification_question` instead of blanking them, and `agent.ask()` stores
+`state.last_plan` on both clarification paths, not just full successes.
+Verified fixed for the case that matters most — a direct answer to the
+agent's own clarifying question ("Renewables", asked which sector → next turn
+correctly filters to Renewables). Not fully fixed: a terse reply following a
+*complete* prior answer (not a question), like "Billed revenue" after a full
+Renewables pipeline answer, doesn't reliably inherit the prior sector filter —
+tried strengthening the merge instruction further, which caused a regression
+elsewhere (the model started guessing at sectors instead of asking for
+clarification) and still didn't fix this specific case, so the change was
+reverted rather than kept. This is disclosed as a real, remaining limitation
+rather than hidden — it's LLM instruction-following reliability on an
+inherently ambiguous case (a two-word reply could reasonably be a fresh
+question or a scoped follow-up), not a deterministic code defect.
+
 ## What we'd do differently with more time
 
+- Track explicitly in `ConversationState` whether the last turn ended on an
+  unanswered clarifying question (a bool, not left for the LLM to infer from
+  a JSON summary each time) — a terse next message would then deterministically
+  know "this is answering that question" instead of relying on the model to
+  correctly judge it from context every single time, which is the open gap
+  documented above.
 - Replace substring-based filter matching with a real fuzzy-matching library
   (e.g. rapidfuzz) — today "renewable" matches "Renewables" via substring
   containment, but a genuine misspelling wouldn't, and would fall through to

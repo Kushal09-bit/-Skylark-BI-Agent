@@ -90,14 +90,20 @@ Rules:
   genuinely unresolvable without guessing — e.g. a metric word that could mean two
   different things with materially different answers, or a time range that is core
   to the question and has no sensible default. When you do ask, ask exactly ONE
-  focused question and leave every other field null.
+  focused question about the one thing you're unsure of — but STILL fill in every
+  other field you ARE confident about (e.g. if the sector is clear but the metric
+  isn't, set sector_filter and leave metric/shape unset). The next turn's answer to
+  your question needs those fields to merge onto, or context gets silently dropped.
 - Do NOT ask for things with a reasonable default. If no time range is given: use
   "all_time" for a snapshot/count/breakdown question, and "last_12_months" for a
   trend question. State the default you picked in `assumptions`.
 - If the user's message is a follow-up to the previous plan (shown below, if any) —
-  e.g. "now just Q3", "break that down by month", "what about Renewables" — start
-  from that plan and only change what the user actually asked to change. Don't
-  re-derive fields the user didn't mention changing.
+  e.g. "now just Q3", "break that down by month", "what about Renewables", or a
+  short direct answer to your own clarifying question (e.g. previous plan asked
+  which metric and the user replies "Billed revenue") — start from that plan and
+  only change what the user actually asked to change. Don't re-derive fields the
+  user didn't mention changing, and don't drop a filter (like sector_filter) just
+  because the new message doesn't repeat it.
 - sector_filter / status_filter / owner_filter should be your best-effort guess at
   the real label (e.g. "renewables" -> "Renewables"). Exact casing doesn't matter;
   downstream matching is case-insensitive. If nothing like it plausibly exists on
@@ -250,17 +256,12 @@ def parse_query(
         input_schema=TOOL_SCHEMA["input_schema"],
     )
 
-    if plan_input.get("clarification_question"):
-        return QueryPlan(
-            raw_question=question,
-            boards=[],
-            shape="single_board_lookup",
-            metric="",
-            time_range=TimeRange(None, None, "n/a"),
-            clarification_question=plan_input["clarification_question"],
-            assumptions=plan_input.get("assumptions", []),
-        )
-
+    # Fields are normalized the same way whether or not a clarification is
+    # also being asked — a clarifying question about the metric shouldn't
+    # discard a sector the model was already confident about, or the next
+    # turn's answer has nothing correct to merge onto (a live bug: "Renewables"
+    # then "Billed revenue" lost the sector entirely and answered for all
+    # sectors, because the clarification path used to blank every other field).
     relative = _normalize_enum(plan_input.get("time_range_relative"), TIME_RANGE_RELATIVE_VALUES) or "all_time"
     time_range = resolve_time_range(
         relative,
@@ -282,6 +283,6 @@ def parse_query(
         status_filter=plan_input.get("status_filter"),
         owner_filter=plan_input.get("owner_filter"),
         group_by=_normalize_enum(plan_input.get("group_by"), [g for g in GROUP_BY_OPTIONS if g]),
-        clarification_question=None,
+        clarification_question=plan_input.get("clarification_question"),
         assumptions=plan_input.get("assumptions", []),
     )

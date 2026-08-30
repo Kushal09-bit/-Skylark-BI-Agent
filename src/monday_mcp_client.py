@@ -9,13 +9,13 @@ does a live MCP round trip, per the project's no-static-fallback requirement.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import Any
 
+import anyio
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -124,13 +124,32 @@ class MondayMCPClient:
             args=["-y", "@mondaydotcomorg/monday-api-mcp", "-t", self.api_token],
         )
         try:
-            read, write = await asyncio.wait_for(
-                self._stack.enter_async_context(stdio_client(params)),
-                timeout=self.connect_timeout,
-            )
+            # No timeout wraps stdio_client's own entry — deliberately, not an
+            # oversight. stdio_client.__aenter__ opens an anyio task group
+            # meant to stay alive for the whole session (its reader/writer
+            # pump tasks), which must persist past this method returning.
+            # Both asyncio.wait_for and a lexically-scoped anyio.fail_after
+            # around *just* this entry were tried and reproduced real
+            # failures live: wait_for runs the entry in a separate
+            # ensure_future() task, so the AsyncExitStack.aclose() that closes
+            # it later (from the original task) trips anyio's "exit cancel
+            # scope in a different task" check; fail_after's own scope, being
+            # lexically-closed while stdio_client's nested task group is still
+            # deliberately open, deadlocks on its own __exit__ (anyio forbids
+            # closing an outer scope while an inner one remains open — this
+            # holds even when nothing has actually timed out). Neither pattern
+            # is fixable while the connection must outlive its own setup call;
+            # see DECISION_LOG.md.
+            #
+            # session.initialize() below IS safely wrapped: it's a single
+            # self-contained request/response over the already-open channels,
+            # not a context manager that opens its own lasting task group —
+            # the same reasoning that makes wrapping each _call_tool call safe.
+            read, write = await self._stack.enter_async_context(stdio_client(params))
             session = await self._stack.enter_async_context(ClientSession(read, write))
-            await asyncio.wait_for(session.initialize(), timeout=self.connect_timeout)
-        except asyncio.TimeoutError as exc:
+            with anyio.fail_after(self.connect_timeout):
+                await session.initialize()
+        except TimeoutError as exc:
             await self._stack.aclose()
             raise MondayTimeoutError(
                 f"Timed out connecting to the monday.com MCP server after "
@@ -164,10 +183,9 @@ class MondayMCPClient:
                 "before calling any method."
             )
         try:
-            result = await asyncio.wait_for(
-                self._session.call_tool(name, arguments), timeout=self.tool_timeout
-            )
-        except asyncio.TimeoutError as exc:
+            with anyio.fail_after(self.tool_timeout):
+                result = await self._session.call_tool(name, arguments)
+        except TimeoutError as exc:
             raise MondayTimeoutError(
                 f"monday.com didn't respond to `{name}` within {self.tool_timeout}s. "
                 f"The board may be too large for one request, or monday.com is slow "
