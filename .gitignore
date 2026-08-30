@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+.streamlit/secrets.toml
+.DS_Store
+*.egg-info/
+.pytest_cache/
+.env
+.mcp.json
+.env
+.mcp.json
