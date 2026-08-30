@@ -390,17 +390,33 @@ def breakdown_by_field(board: BoardData, field: str, value_field: str | None = N
 
 
 def trend_over_time(
-    board: BoardData, date_field: str, value_field: str | None, granularity: str = "month"
+    board: BoardData,
+    date_field: str,
+    value_field: str | None,
+    granularity: str = "month",
+    start: date | None = None,
+    end: date | None = None,
 ) -> dict:
     """Buckets items by month/quarter of `date_field`; sums value_field per bucket
     (or counts items if value_field is None). Returns buckets in chronological order
-    plus a trend_direction comparing the last two buckets."""
+    plus a trend_direction comparing the last two buckets.
+
+    start/end MUST be passed whenever the surrounding question has a time range
+    (e.g. "this quarter") — a live bug showed that omitting them makes a "break
+    that down by month" follow-up silently answer over all-time data instead of
+    the same window the previous turn was scoped to, producing two answers that
+    contradict each other despite claiming to describe the same period.
+    """
     buckets: dict[str, list[dict]] = {}
     excluded = 0
+    out_of_range = 0
     for item in board.items:
         d = parse_date(board.get(item, date_field))
         if d is None:
             excluded += 1
+            continue
+        if not _in_range(d, start, end):
+            out_of_range += 1
             continue
         if granularity == "quarter":
             key = f"{d.year}-Q{(d.month - 1) // 3 + 1}"
@@ -418,17 +434,36 @@ def trend_over_time(
             series.append({"period": period, "value": len(items), "count": len(items)})
 
     trend_direction = "flat"
+    interpretation = "No data in this range to show a trend"
     if len(series) >= 2:
-        prev, last = series[-2]["value"], series[-1]["value"]
+        prev_period, last_period = series[-2], series[-1]
+        prev, last = prev_period["value"], last_period["value"]
         if prev == 0:
             trend_direction = "up" if last > 0 else "flat"
         else:
             change = (last - prev) / prev
             trend_direction = "up" if change > 0.05 else "down" if change < -0.05 else "flat"
+        # Same two buckets trend_direction was computed from — keeping both
+        # fields anchored to the same comparison is what the narrator is told
+        # to rely on instead of judging direction from the numbers itself.
+        interpretation = (
+            f"Trend is {trend_direction}: {prev_period['period']} was {prev:,.0f}, "
+            f"{last_period['period']} was {last:,.0f}"
+        )
+    elif len(series) == 1:
+        interpretation = f"Only one period of data ({series[0]['period']}): {series[0]['value']:,.0f}"
 
     disclosures = []
     if excluded:
         noun = "record" if excluded == 1 else "records"
         disclosures.append(f"{excluded} {noun} excluded (no parseable {date_field.replace('_', ' ')})")
+    if out_of_range and (start or end):
+        noun = "record" if out_of_range == 1 else "records"
+        disclosures.append(f"{out_of_range} {noun} fell outside the requested date range")
 
-    return {"series": series, "trend_direction": trend_direction, "disclosures": disclosures}
+    return {
+        "series": series,
+        "trend_direction": trend_direction,
+        "interpretation": interpretation,
+        "disclosures": disclosures,
+    }

@@ -163,10 +163,17 @@ def _compute(plan: QueryPlan, boards: dict[str, I.BoardData], today: date) -> di
         return group_dispatch[plan.group_by]()
 
     if plan.shape == "trend_over_time" or plan.group_by in ("month", "quarter"):
+        granularity = "quarter" if plan.group_by == "quarter" else "month"
+        # start/end MUST be passed here — a live bug showed that omitting them
+        # makes a "break that down by month" follow-up silently ignore the
+        # time range ("this quarter") the previous turn was scoped to,
+        # producing a monthly breakdown from unrelated periods that
+        # contradicts the quarter-bounded headline number it's supposedly
+        # detailing. See DECISION_LOG.md.
         if boards.get("deals") is not None:
             value_field = "deal_value" if plan.metric in ("pipeline_value", "revenue_billed") else None
-            return I.trend_over_time(deals, "created_date", value_field, "month")
-        return I.trend_over_time(wo, "probable_end_date", "billed_incl_gst", "month")
+            return I.trend_over_time(deals, "created_date", value_field, granularity, start, end)
+        return I.trend_over_time(wo, "probable_end_date", "billed_incl_gst", granularity, start, end)
 
     if plan.metric == "sector_breakdown" or plan.shape == "sector_breakdown":
         return I.sector_breakdown(wo, deals)
@@ -210,7 +217,36 @@ phrase a clear, natural answer:
 - Never mention column ids, internal function names, or that you were "given" this data — just answer.
 - Any list field with a companion "..._note" field is a truncated sample, not the full population — never
   count, categorize, or state a breakdown derived from it; use only explicit count/total fields for numbers.
+- If a `trend_direction` field is present ("up"/"down"/"flat"), that word is authoritative — state the
+  trend using exactly that direction. Do not independently judge "rising"/"falling" by eyeballing the
+  series numbers yourself; a live bug showed this produces a directly contradictory description (calling
+  a rise a "downward trend") even when given the correct numbers.
 """
+
+
+_DOWN_WORDS_RE = re.compile(
+    r"\b(down(?:ward)?|declin\w*|dropp?\w*|fell|falling|decreas\w*|lower|shrink\w*|slump\w*|sli[dp]\w*)\b",
+    re.IGNORECASE,
+)
+_UP_WORDS_RE = re.compile(
+    r"\b(up(?:ward)?|increas\w*|grow\w*|ris(?:ing|en)|climb\w*|higher|surg\w*|jump\w*|rebound\w*)\b",
+    re.IGNORECASE,
+)
+
+
+def _trend_direction_consistent(answer: str, computed: dict) -> bool:
+    """`trend_direction` is computed correctly (see insights.trend_over_time) —
+    this catches the narrator contradicting it. A live bug: given a series
+    that rose (₹0 -> ₹1.9 Cr, trend_direction="up"), the narration described
+    it as a "downward trend" anyway, apparently judging direction by eye
+    rather than using the provided field. Word-boundary regex, not plain
+    substring containment — "down" alone would false-positive inside
+    "breakdown" (a word that shows up constantly in these answers)."""
+    direction = computed.get("trend_direction")
+    if direction not in ("up", "down"):
+        return True
+    contradicting = _DOWN_WORDS_RE if direction == "up" else _UP_WORDS_RE
+    return not contradicting.search(answer)
 
 
 def _looks_consistent(answer: str, computed: dict) -> bool:
@@ -223,6 +259,8 @@ def _looks_consistent(answer: str, computed: dict) -> bool:
     underlying computation was never wrong; this catches the rare case where
     phrasing it went wrong, so a retry (and a guaranteed-correct fallback
     below) can recover instead of showing the user a wrong number."""
+    if not _trend_direction_consistent(answer, computed):
+        return False
     interpretation = computed.get("interpretation")
     if not isinstance(interpretation, str):
         return True

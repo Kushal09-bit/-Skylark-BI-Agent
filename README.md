@@ -151,5 +151,6 @@ skylark-bi-agent/
 ├── app.py                      # Streamlit UI
 └── tests/
     ├── test_normalize.py
-    └── test_query_engine.py
+    ├── test_query_engine.py
+    └── test_insights.py
 ```
